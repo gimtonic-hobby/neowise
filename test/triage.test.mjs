@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test, { after } from "node:test";
 import {
   AI_TIMEOUT_MS,
@@ -146,4 +147,139 @@ test("страница отдаётся по GET / и содержит блок 
   const page = await response.text();
   assert.match(page, /id="draft"/);
   assert.match(page, /manual_review/);
+});
+/**
+ * Загружает inline-скрипт index.html в фейковый DOM, чтобы проверить
+ * реальное поведение страницы без браузера и без зависимостей.
+ */
+function loadTriagePage() {
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+  const match = html.match(/<script type="module">([\s\S]*?)<\/script>/);
+  assert.ok(match, "на странице должен быть module-скрипт");
+
+  function makeElement(name) {
+    return {
+      name,
+      textContent: "",
+      value: "",
+      hidden: false,
+      disabled: false,
+      dataset: {},
+      listeners: new Map(),
+      addEventListener(type, handler) {
+        this.listeners.set(type, handler);
+      },
+      querySelector() {
+        return null;
+      },
+      focus() {},
+    };
+  }
+
+  const form = makeElement("form");
+  const input = makeElement("#message");
+  const status = makeElement("#status");
+  const result = makeElement("#result");
+  const topic = makeElement("#topic");
+  const draft = makeElement("#draft");
+  const button = makeElement("button");
+  const elements = { form, input, status, result, topic, draft, button };
+
+  form.querySelector = (selector) => (selector === "button" ? button : null);
+
+  const bySelector = {
+    form,
+    "#message": input,
+    "#status": status,
+    "#result": result,
+    "#topic": topic,
+    "#draft": draft,
+  };
+  const documentStub = { querySelector: (selector) => bySelector[selector] ?? null };
+
+  const calls = [];
+  let reply = { status: 200, body: null };
+
+  async function fetchStub(url, options) {
+    calls.push({ url, options });
+    return { status: reply.status, json: async () => reply.body };
+  }
+
+  // Скрипт страницы не содержит import/export, поэтому его можно выполнить
+  // как обычную функцию, подменив document и fetch.
+  const runPage = new Function("document", "fetch", match[1]);
+  runPage(documentStub, fetchStub);
+
+  return {
+    elements,
+    calls,
+    respondWith({ status = 200, body = null }) {
+      reply = { status, body };
+    },
+    async submit() {
+      const handler = form.listeners.get("submit");
+      assert.ok(handler, "форма должна обрабатывать submit");
+      await handler({ preventDefault() {} });
+    },
+  };
+}
+
+test("сбой manual_review очищает предыдущий черновик на странице", async () => {
+  const page = loadTriagePage();
+  page.elements.input.value = "Нужна доставка";
+  page.elements.topic.textContent = "Доставка";
+  page.elements.draft.textContent = "Старый черновик";
+  page.elements.result.hidden = false;
+  page.respondWith({ status: 200, body: { status: "manual_review", topic: null, draft: null } });
+
+  await page.submit();
+
+  assert.equal(page.elements.topic.textContent, "");
+  assert.equal(page.elements.draft.textContent, "");
+  assert.equal(page.elements.result.hidden, true);
+  assert.match(page.elements.status.textContent, /вручную/);
+  assert.equal(page.elements.button.disabled, false);
+});
+
+test("ответ не-JSON очищает предыдущий черновик и показывает ручной разбор", async () => {
+  const page = loadTriagePage();
+  page.elements.input.value = "Заявка";
+  page.elements.draft.textContent = "Старый черновик";
+  page.elements.result.hidden = false;
+  page.respondWith({ status: 200, body: null });
+
+  await page.submit();
+
+  assert.equal(page.elements.draft.textContent, "");
+  assert.equal(page.elements.result.hidden, true);
+  assert.match(page.elements.status.textContent, /вручную/);
+});
+
+test("пустой ввод очищает черновик и не обращается к API", async () => {
+  const page = loadTriagePage();
+  page.elements.draft.textContent = "Старый черновик";
+  page.elements.result.hidden = false;
+
+  await page.submit();
+
+  assert.equal(page.calls.length, 0);
+  assert.equal(page.elements.draft.textContent, "");
+  assert.equal(page.elements.result.hidden, true);
+  assert.match(page.elements.status.textContent, /Введите текст заявки/);
+});
+
+test("успех заменяет старый черновик новым", async () => {
+  const page = loadTriagePage();
+  page.elements.input.value = "Цена доставки?";
+  page.elements.draft.textContent = "Старый черновик";
+  page.respondWith({
+    status: 200,
+    body: { status: "ready", topic: "pricing", draft: "Новый черновик" },
+  });
+
+  await page.submit();
+
+  assert.equal(page.elements.topic.textContent, "Стоимость");
+  assert.equal(page.elements.draft.textContent, "Новый черновик");
+  assert.equal(page.elements.result.hidden, false);
 });
